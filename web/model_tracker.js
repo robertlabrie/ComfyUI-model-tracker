@@ -136,17 +136,76 @@ class ModelTrackerPanel {
     }
 }
 
+class ModelTrackerModal {
+    constructor() {
+        this.panel = null;
+
+        this.overlay = document.createElement("div");
+        this.overlay.className = "model-tracker-modal-overlay";
+        this.overlay.style.cssText =
+            "display:none;position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,0.5);align-items:center;justify-content:center;";
+        this.overlay.addEventListener("mousedown", (e) => {
+            if (e.target === this.overlay) this.close();
+        });
+
+        this.card = document.createElement("div");
+        this.card.style.cssText =
+            "display:flex;flex-direction:column;width:min(1100px,90vw);height:min(750px,85vh);background:var(--comfy-menu-bg,#202020);color:var(--fg-color,#ddd);border-radius:8px;box-shadow:0 10px 40px rgba(0,0,0,0.6);overflow:hidden;";
+
+        const header = document.createElement("div");
+        header.style.cssText =
+            "display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--border-color,#333);flex:none;";
+        header.innerHTML = `<div style="font-size:16px;font-weight:600;">Model Usage</div>`;
+
+        const closeButton = document.createElement("button");
+        closeButton.textContent = "✕";
+        closeButton.style.cssText =
+            "background:transparent;color:var(--fg-color,#ddd);border:none;font-size:16px;cursor:pointer;padding:4px 8px;";
+        closeButton.addEventListener("click", () => this.close());
+        header.appendChild(closeButton);
+
+        this.body = document.createElement("div");
+        this.body.style.cssText = "flex:1;min-height:0;";
+
+        this.card.appendChild(header);
+        this.card.appendChild(this.body);
+        this.overlay.appendChild(this.card);
+        document.body.appendChild(this.overlay);
+
+        this.onKeyDown = (e) => {
+            if (e.key === "Escape" && this.overlay.style.display !== "none") this.close();
+        };
+    }
+
+    show() {
+        this.overlay.style.display = "flex";
+        document.addEventListener("keydown", this.onKeyDown);
+        if (!this.panel) {
+            this.panel = new ModelTrackerPanel(this.body);
+        } else {
+            this.panel.refresh();
+        }
+    }
+
+    close() {
+        this.overlay.style.display = "none";
+        document.removeEventListener("keydown", this.onKeyDown);
+    }
+}
+
 app.registerExtension({
     name: "Comfy.ModelTracker",
     setup() {
+        const modal = new ModelTrackerModal();
+
         app.extensionManager.registerSidebarTab({
             id: "modelTracker",
             title: "Model Usage",
             icon: "pi pi-chart-bar",
             tooltip: "Track which models on disk are actually being used",
             type: "custom",
-            render: (el) => {
-                new ModelTrackerPanel(el);
+            render: () => {
+                modal.show();
             },
         });
     },
