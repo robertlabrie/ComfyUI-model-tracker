@@ -57,54 +57,68 @@ path and the stats API as the source of truth for "what models exist on disk."
   last_used}`. Stored under `folder_paths.get_system_user_directory("model_tracker")` (i.e.
   `ComfyUI/user/__model_tracker/usage_stats.json`) rather than inside this addon's own directory, so
   data survives `git pull`/reinstall of the node and isn't exposed over HTTP (the `__` prefix marks it
-  a system-internal user directory). Writes are atomic (`.tmp` + `os.replace`).
+  a system-internal user directory). Writes are atomic (`.tmp` + `os.replace`). `remove(category,
+  filename)` drops an entry (called after a successful delete so a re-added file starts at zero
+  instead of resurrecting a stale count).
 
-- **`routes.py`** — `GET /model_tracker/stats` merges the live on-disk file list (with size/mtime via
-  `os.stat`) with the persisted usage counts, keyed the same way as the store.
+- **`routes.py`** — two endpoints:
+  - `GET /model_tracker/stats` merges the live on-disk file list (with size/mtime via `os.stat`) with
+    the persisted usage counts, keyed the same way as the store.
+  - `POST /model_tracker/delete` takes `{"models": [{"category", "filename"}, ...]}` and permanently
+    deletes each file from disk (`os.remove`) plus its usage-store entry, returning a per-item
+    `{category, filename, success, error?}` so partial failures are visible. Path safety relies
+    entirely on `folder_paths.get_full_path(category, filename)` — it rebases the filename under the
+    category's real root and collapses `..` traversal by construction (verified: a `../../../etc/hosts`
+    style filename resolves to `None`, not an escape), so there's no separate path-traversal check to
+    maintain here. Only deletes a path that both resolves via that function *and* passes
+    `os.path.isfile` — an unresolvable request is reported as `"file not found"`, not silently skipped.
 
-- **`web/model_tracker.js`** — a `ModelTrackerDialog extends ComfyDialog` (from `scripts/ui.js`) shown
-  as a big centered `.comfy-modal` popup, not a docked panel — the first iteration used
-  `registerSidebarTab` alone (a panel sliding out from the side), which is what the report itself now
-  deliberately avoids. Fetches `/model_tracker/stats` via `api.fetchApi` on each `show()` and renders a
-  filterable/sortable table inside the dialog, default sorted least-recently-used first.
+- **`web/model_tracker.js`** — two classes:
+  - `ModelTrackerPanel` — the actual report: filter box, sort dropdown, refresh, the table, row
+    checkboxes + a "Delete Selected" button. `deleteSelected()` confirms via `window.confirm()` (this
+    is a permanent disk delete — don't remove that confirmation), POSTs to `/model_tracker/delete`,
+    surfaces any per-item failures via `window.alert()`, then always calls `refresh()` afterward so
+    the table reflects what's actually left on disk rather than trusting the client-side state.
+  - `ModelTrackerModal` — a plain `position:fixed` overlay + centered card, built with vanilla
+    `document.createElement` (deliberately **not** a `ComfyDialog` subclass — see the note below on
+    why that was tried and reverted). Lazily constructs one `ModelTrackerPanel` into its body on first
+    `show()`, and calls `panel.refresh()` on every subsequent `show()` so data is never stale.
+    Closes on the ✕ button, clicking the backdrop, or Escape.
 
-  There are **two** entry points registered, because this frontend's default layout is the left-dock
-  ("Assets / Nodes / Models / Workflows / Apps / Templates" icon rail), not the classic top menu bar:
-  - `registerSidebarTab` — the primary, confirmed-reliable one. It shows up as an icon in that left
-    dock; its `render(el)` callback calls `dialog.show()` immediately (plus leaves a manual "Open
-    Model Usage" button in the thin sidebar panel as a fallback) so the report itself is always the
-    big dialog, never the docked panel content.
-  - A `ComfyButton` inserted into the top menu via `app.menu.settingsGroup.element.before(...)`
-    (mirroring how `comfyui-manager.js` attaches its own toolbar button) — this is a bonus for anyone
-    on the "Legacy" topbar layout, where `app.menu.settingsGroup` actually exists. It's wrapped in a
-    guarded `if`, not relied upon, because it silently does nothing in the default left-dock layout
-    (confirmed: the button never appeared there). The newer `actionBarButtons` extension field was
-    considered instead but also only renders under that same Legacy layout.
+  The single entry point is `app.extensionManager.registerSidebarTab(...)`, whose `render()` callback
+  just calls `modal.show()` — it does not put the report content into the sidebar panel itself. This
+  is deliberate: the sidebar icon is the only reliably-working attach point in this frontend's default
+  left-dock layout (see below), but a docked sliding panel was explicitly rejected in favor of a big
+  centered dialog, so the icon is used purely as a button that happens to live in that dock.
 
   Loaded because `__init__.py` sets `WEB_DIRECTORY = "web"`; ComfyUI serves that directory's contents
-  directly at `/extensions/ComfyUI-model-tracker/...`, so `scripts/app.js`/`scripts/api.js`/
-  `scripts/ui.js` imports need `../../`.
+  directly at `/extensions/ComfyUI-model-tracker/...`, so `scripts/app.js`/`scripts/api.js` imports
+  need `../../`.
+
+  **Tried and reverted:** a `ComfyButton` inserted into the top menu via
+  `app.menu.settingsGroup.element.before(...)` (mirroring `comfyui-manager.js`'s own toolbar button)
+  was added as a second entry point for users on the classic "Legacy" topbar layout. It was removed
+  again — this frontend's default layout is the left-dock icon rail (Assets/Nodes/Models/Workflows/
+  Apps/Templates), where `app.menu.settingsGroup` doesn't exist, so the button silently never
+  attached. Don't re-add it without a real need; the sidebar tab alone covers the layout this addon is
+  actually used in.
 
 - **`__init__.py`** — the ComfyUI entry point. `NODE_CLASS_MAPPINGS = {}` — this addon registers no
   actual nodes; it only installs the background hook and HTTP route on import.
 
 ## A frontend bug worth remembering
 
-`ComfyDialog` subclasses (`scripts/ui.js`) do **not** get a usable `this.element` for free from
-`super()`. Every real example in `comfyui-manager`'s source explicitly builds and assigns
-`this.element = $el("div.comfy-modal", {parent: document.body}, [content])` itself in the
-constructor. An earlier version of `ModelTrackerDialog` assumed the base class already created
-`this.element` and called `.classList.add(...)` on it before ever assigning it — that threw
-synchronously inside the dialog's constructor, which ran *before* `registerSidebarTab` in the same
-`async setup()`, so the exception silently aborted the whole extension and **both** entry points
-(sidebar icon and top-menu button) vanished with no error visible anywhere in the server log (this is
-a client-side JS exception; check the browser console, not `user/comfyui.log`, for frontend bugs
-here). Fixed by building `content` first and assigning `this.element` explicitly, matching the
-pattern every other `ComfyDialog` subclass in this codebase's ecosystem actually uses.
-
-`setup()` now also wraps dialog construction in its own try/catch and keeps registering the sidebar
-tab even if it fails (rendering an error message instead) — don't let a bug in the dialog take down
-the entry point again.
+An earlier iteration made the popup a `ComfyDialog` subclass (`scripts/ui.js`) and assumed `super()`
+hands you a usable `this.element` for free. It doesn't — every real example in `comfyui-manager`'s
+source explicitly builds and assigns `this.element = $el("div.comfy-modal", {...}, [content])` itself
+in the constructor. That version called `.classList.add(...)` on `this.element` before ever assigning
+it, which threw synchronously inside the constructor — and because dialog construction happened
+*before* `registerSidebarTab` in the same `async setup()`, the exception silently aborted the whole
+extension and the sidebar icon itself vanished with no error visible anywhere in the server log (this
+is a client-side JS exception; check the browser console, not `user/comfyui.log`, for frontend bugs
+here). The fix that stuck was to stop using `ComfyDialog` entirely — `ModelTrackerModal` is now plain
+`document.createElement`, nothing inherited to get wrong. If a future change reintroduces
+`ComfyDialog`, build content first and assign `this.element` explicitly.
 
 ## Key design decisions (don't relitigate without reason)
 
@@ -125,7 +139,12 @@ the entry point again.
   (both are known, currently-unhandled gaps, not oversights).
 
 - **One usage increment per prompt submission per model, not per node instance.** If the same model
-  file is referenced by two nodes in one submitted graph, it's deduped to a single count
-  (`hooks.py`'s per-submission `seen` set in `usage_store.record_usage`) — the counter answers "how
-  many workflow runs used this model," not "how many node calls" — see the `seen` set in
-  `usage_store.record_usage`.
+  file is referenced by two nodes in one submitted graph, it's deduped to a single count via the
+  `seen` set in `usage_store.record_usage` — the counter answers "how many workflow runs used this
+  model," not "how many node calls."
+
+- **Delete is a real, permanent `os.remove` — the browser `confirm()` in `deleteSelected()` is the
+  only guard rail.** There's no trash/undo. This is intentional (the whole point of the tool is
+  disk cleanup), but it means: never remove that confirmation dialog, and always re-`refresh()`
+  after a delete rather than optimistically updating client-side state, so the table can't drift from
+  what's actually on disk.

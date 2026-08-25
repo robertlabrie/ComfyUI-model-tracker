@@ -31,7 +31,13 @@ const SORTERS = {
     last_used_desc: (a, b) => (b.last_used || 0) - (a.last_used || 0),
     size_desc: (a, b) => (b.size_bytes || 0) - (a.size_bytes || 0),
     name_asc: (a, b) => a.filename.localeCompare(b.filename),
+    uses_asc: (a, b) => (a.total_uses || 0) - (b.total_uses || 0),
+    uses_desc: (a, b) => (b.total_uses || 0) - (a.total_uses || 0),
 };
+
+function modelKey(model) {
+    return `${model.category}|${model.filename}`;
+}
 
 class ModelTrackerPanel {
     constructor(container) {
@@ -39,6 +45,7 @@ class ModelTrackerPanel {
         this.models = [];
         this.sortKey = "last_used_asc";
         this.filterText = "";
+        this.selected = new Set();
         this.render();
         this.refresh();
     }
@@ -51,16 +58,20 @@ class ModelTrackerPanel {
                     <select class="mt-sort" style="background:var(--comfy-input-bg,#222);color:var(--input-text,#ddd);border:1px solid var(--border-color,#444);border-radius:4px;">
                         <option value="last_used_asc">Least recently used</option>
                         <option value="last_used_desc">Most recently used</option>
+                        <option value="uses_asc">Fewest uses</option>
+                        <option value="uses_desc">Most uses</option>
                         <option value="size_desc">Largest first</option>
                         <option value="name_asc">Name (A-Z)</option>
                     </select>
                     <button class="mt-refresh" style="background:var(--comfy-input-bg,#222);color:var(--input-text,#ddd);border:1px solid var(--border-color,#444);border-radius:4px;padding:4px 8px;cursor:pointer;">Refresh</button>
+                    <button class="mt-delete" disabled style="color:#fff;background:#7a2020;border:1px solid #a33;border-radius:4px;padding:4px 10px;cursor:pointer;opacity:0.5;">Delete Selected</button>
                 </div>
                 <div class="mt-status" style="padding:4px 8px;opacity:0.7;"></div>
                 <div class="mt-table-wrap" style="flex:1;overflow:auto;">
                     <table style="width:100%;border-collapse:collapse;">
                         <thead>
                             <tr style="position:sticky;top:0;background:var(--comfy-menu-bg,#1a1a1a);text-align:left;">
+                                <th style="padding:6px 8px;width:24px;"><input type="checkbox" class="mt-select-all"></th>
                                 <th style="padding:6px 8px;">Category</th>
                                 <th style="padding:6px 8px;">Filename</th>
                                 <th style="padding:6px 8px;">Size</th>
@@ -77,6 +88,8 @@ class ModelTrackerPanel {
         this.filterInput = this.container.querySelector(".mt-filter");
         this.sortSelect = this.container.querySelector(".mt-sort");
         this.refreshButton = this.container.querySelector(".mt-refresh");
+        this.deleteButton = this.container.querySelector(".mt-delete");
+        this.selectAllCheckbox = this.container.querySelector(".mt-select-all");
         this.statusEl = this.container.querySelector(".mt-status");
         this.tbody = this.container.querySelector(".mt-tbody");
 
@@ -91,9 +104,17 @@ class ModelTrackerPanel {
             this.renderRows();
         });
         this.refreshButton.addEventListener("click", () => this.refresh());
+        this.deleteButton.addEventListener("click", () => this.deleteSelected());
+        this.selectAllCheckbox.addEventListener("change", () => {
+            for (const cb of this.tbody.querySelectorAll(".mt-row-select")) {
+                cb.checked = this.selectAllCheckbox.checked;
+                this.toggleSelection(cb.dataset.key, this.selectAllCheckbox.checked);
+            }
+        });
     }
 
     async refresh() {
+        this.selected.clear();
         this.statusEl.textContent = "Loading...";
         try {
             const response = await api.fetchApi("/model_tracker/stats");
@@ -105,6 +126,60 @@ class ModelTrackerPanel {
             console.error("model-tracker: failed to load stats", err);
             this.statusEl.textContent = "Failed to load model usage stats.";
         }
+    }
+
+    toggleSelection(key, isSelected) {
+        if (isSelected) {
+            this.selected.add(key);
+        } else {
+            this.selected.delete(key);
+        }
+        this.updateDeleteButton();
+    }
+
+    updateDeleteButton() {
+        const count = this.selected.size;
+        this.deleteButton.disabled = count === 0;
+        this.deleteButton.style.opacity = count === 0 ? "0.5" : "1";
+        this.deleteButton.textContent = count === 0 ? "Delete Selected" : `Delete Selected (${count})`;
+    }
+
+    async deleteSelected() {
+        const targets = this.models.filter((model) => this.selected.has(modelKey(model)));
+        if (targets.length === 0) return;
+
+        const names = targets.map((m) => m.filename).join("\n");
+        const confirmed = window.confirm(
+            `Permanently delete ${targets.length} model file(s) from disk?\n\n${names}`
+        );
+        if (!confirmed) return;
+
+        this.deleteButton.disabled = true;
+        this.statusEl.textContent = "Deleting...";
+        try {
+            const response = await api.fetchApi("/model_tracker/delete", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    models: targets.map((m) => ({ category: m.category, filename: m.filename })),
+                }),
+            });
+            const data = await response.json();
+            const results = data.results || [];
+            const failed = results.filter((r) => !r.success);
+            if (failed.length > 0) {
+                console.error("model-tracker: some deletions failed", failed);
+                window.alert(
+                    `${results.length - failed.length} of ${results.length} deleted. Failures:\n` +
+                    failed.map((f) => `${f.filename}: ${f.error}`).join("\n")
+                );
+            }
+        } catch (err) {
+            console.error("model-tracker: delete request failed", err);
+            window.alert("Delete request failed. See console for details.");
+        }
+
+        await this.refresh();
     }
 
     renderRows() {
@@ -120,19 +195,25 @@ class ModelTrackerPanel {
         const sorter = SORTERS[this.sortKey] || SORTERS.last_used_asc;
         rows = rows.slice().sort(sorter);
 
+        this.selectAllCheckbox.checked = false;
         this.tbody.innerHTML = "";
         for (const model of rows) {
+            const key = modelKey(model);
             const tr = document.createElement("tr");
             tr.style.borderBottom = "1px solid var(--border-color,#2a2a2a)";
             tr.innerHTML = `
+                <td style="padding:4px 8px;"><input type="checkbox" class="mt-row-select" data-key="${key}" ${this.selected.has(key) ? "checked" : ""}></td>
                 <td style="padding:4px 8px;opacity:0.8;">${model.category}</td>
                 <td style="padding:4px 8px;word-break:break-all;">${model.filename}</td>
                 <td style="padding:4px 8px;white-space:nowrap;">${formatBytes(model.size_bytes)}</td>
                 <td style="padding:4px 8px;white-space:nowrap;">${formatLastUsed(model.last_used)}</td>
                 <td style="padding:4px 8px;text-align:right;">${model.total_uses}</td>
             `;
+            const checkbox = tr.querySelector(".mt-row-select");
+            checkbox.addEventListener("change", () => this.toggleSelection(key, checkbox.checked));
             this.tbody.appendChild(tr);
         }
+        this.updateDeleteButton();
     }
 }
 

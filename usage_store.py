@@ -63,3 +63,10 @@ class UsageStore:
     def get_all(self):
         with self._lock:
             return dict(self._data["entries"])
+
+    def remove(self, category, filename):
+        with self._lock:
+            key = self._key(category, filename)
+            if key in self._data["entries"]:
+                del self._data["entries"][key]
+                self._save()

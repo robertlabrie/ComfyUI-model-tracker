@@ -52,3 +52,40 @@ def install(store):
             "models": models,
             "generated_at": int(time.time() * 1000),
         })
+
+    @routes.post("/model_tracker/delete")
+    async def delete_models(request):
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+
+        entries = body.get("models") if isinstance(body, dict) else None
+        if not isinstance(entries, list):
+            return web.json_response(
+                {"error": "expected {'models': [{'category': ..., 'filename': ...}, ...]}"},
+                status=400,
+            )
+
+        results = []
+        for entry in entries:
+            category = entry.get("category") if isinstance(entry, dict) else None
+            filename = entry.get("filename") if isinstance(entry, dict) else None
+            if not category or not filename:
+                results.append({"category": category, "filename": filename, "success": False, "error": "missing category/filename"})
+                continue
+
+            full_path = folder_paths.get_full_path(category, filename)
+            if not full_path or not os.path.isfile(full_path):
+                results.append({"category": category, "filename": filename, "success": False, "error": "file not found"})
+                continue
+
+            try:
+                os.remove(full_path)
+                store.remove(category, filename)
+                results.append({"category": category, "filename": filename, "success": True})
+            except OSError as exc:
+                logger.exception("model-tracker: failed to delete %s", full_path)
+                results.append({"category": category, "filename": filename, "success": False, "error": str(exc)})
+
+        return web.json_response({"results": results})
